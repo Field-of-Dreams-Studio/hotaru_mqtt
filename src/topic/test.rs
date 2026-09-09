@@ -85,9 +85,36 @@ fn path_to_wire_round_trip() {
 }
 
 #[test]
-fn validate_fast_path() {
+fn validation_uses_the_topic_grammars() {
     assert!(validate_subscribe_filter("a/+/b").is_ok());
     assert!(validate_subscribe_filter("a/#/b").is_err());
     assert!(validate_publish_topic("a/b/c").is_ok());
     assert!(validate_publish_topic("a/+").is_err());
+}
+
+#[test]
+fn framework_tokens_use_the_mqtt_filter_grammar() {
+    let tokens = tokenize_subscribe_filter(r"sensors/+/a\<b/#").unwrap();
+    let (patterns, _) = hotaru_core::url::tokens_to_patterns(&tokens).unwrap();
+    assert_eq!(
+        patterns,
+        vec![
+            PathPattern::Literal("sensors".into()),
+            PathPattern::Any,
+            PathPattern::Literal(r"a\<b".into()),
+            PathPattern::AnyPath,
+        ]
+    );
+}
+
+#[test]
+fn framework_tokens_reject_invalid_mqtt_filters() {
+    assert!(tokenize_subscribe_filter("a/#/b").is_err());
+    assert!(tokenize_subscribe_filter("a+b").is_err());
+}
+
+#[test]
+fn literal_split_preserves_empty_levels() {
+    assert_eq!(split_topic_literal("a//b/"), vec!["a", "", "b", ""]);
+    assert!(split_topic_literal("").is_empty());
 }

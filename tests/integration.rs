@@ -573,6 +573,74 @@ async fn wildcard_hash_matches() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn only_literal_system_filters_receive_system_topics() {
+    let (port, _broker) = start_broker().await;
+
+    let (mut wildcard_reader, mut wildcard_writer) = connect_raw(port).await;
+    send_packet(&mut wildcard_writer, &connect_packet("root-wildcard")).await;
+    let _ = read_packet(&mut wildcard_reader).await;
+    send_packet(
+        &mut wildcard_writer,
+        &Packet::Subscribe(SubscribePacket {
+            packet_id: 1,
+            subscriptions: vec![TopicSubscription {
+                topic: Arc::from("#"),
+                qos: QoS::AtMostOnce,
+            }],
+        }),
+    )
+    .await;
+    let _ = read_packet(&mut wildcard_reader).await;
+
+    let (mut system_reader, mut system_writer) = connect_raw(port).await;
+    send_packet(&mut system_writer, &connect_packet("system-literal")).await;
+    let _ = read_packet(&mut system_reader).await;
+    send_packet(
+        &mut system_writer,
+        &Packet::Subscribe(SubscribePacket {
+            packet_id: 2,
+            subscriptions: vec![TopicSubscription {
+                topic: Arc::from("$SYS/#"),
+                qos: QoS::AtMostOnce,
+            }],
+        }),
+    )
+    .await;
+    let _ = read_packet(&mut system_reader).await;
+
+    let (mut pub_reader, mut pub_writer) = connect_raw(port).await;
+    send_packet(&mut pub_writer, &connect_packet("system-publisher")).await;
+    let _ = read_packet(&mut pub_reader).await;
+    send_packet(
+        &mut pub_writer,
+        &Packet::Publish(PublishPacket {
+            topic: Arc::from("$SYS/status"),
+            payload: bytes::Bytes::from_static(b"system"),
+            dup: false,
+            qos: QoS::AtMostOnce,
+            retain: false,
+            packet_id: None,
+        }),
+    )
+    .await;
+
+    match read_packet(&mut system_reader).await {
+        Packet::Publish(publish) => assert_eq!(publish.topic.as_ref(), "$SYS/status"),
+        other => panic!("expected system PUBLISH, got {other:?}"),
+    }
+
+    let wildcard_delivery = timeout(
+        Duration::from_millis(300),
+        codec::read_packet(&mut wildcard_reader, ANY_SIZE),
+    )
+    .await;
+    assert!(
+        wildcard_delivery.is_err(),
+        "root wildcard must not receive $ topics; got {wildcard_delivery:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn fanout_to_multiple_subscribers() {
     let (port, _broker) = start_broker().await;
@@ -1447,6 +1515,47 @@ fn register_endpoint(
 ) {
     root.sub_url(path, binding, params)
         .expect("endpoint registration");
+}
+
+#[tokio::test]
+async fn hash_endpoint_matches_its_parent_topic() {
+    let (port, _broker, root) = start_broker_with_root().await;
+    let fired = Arc::new(tokio::sync::Notify::new());
+    let handler_fired = fired.clone();
+    register_endpoint(
+        &root,
+        "sport/<**path>",
+        ExecutableBinding::new().with_handler(Arc::new(
+            move |ctx: MqttContext| {
+                let handler_fired = handler_fired.clone();
+                async move {
+                    handler_fired.notify_one();
+                    Ok(ctx)
+                }
+            },
+        )),
+        ParamsClone::default(),
+    );
+
+    let (mut reader, mut writer) = connect_raw(port).await;
+    send_packet(&mut writer, &connect_packet("hash-parent-publisher")).await;
+    let _ = read_packet(&mut reader).await;
+    send_packet(
+        &mut writer,
+        &Packet::Publish(PublishPacket {
+            topic: Arc::from("sport"),
+            payload: bytes::Bytes::from_static(b"parent"),
+            dup: false,
+            qos: QoS::AtMostOnce,
+            retain: false,
+            packet_id: None,
+        }),
+    )
+    .await;
+
+    timeout(Duration::from_secs(1), fired.notified())
+        .await
+        .expect("sport/# endpoint did not run for the parent topic sport");
 }
 
 /// The finding this whole PR exists for, reproduced end to end.

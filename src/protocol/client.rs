@@ -252,12 +252,10 @@ async fn dispatch_inbound_to_endpoints<W, TS>(
     TS: TransportSpec<Wire = W>,
 {
     let topic = publish.topic.clone();
-    let segments: Vec<&str> = topic.split('/').collect();
-    let mut cursor = root.walk_cursor(&topic);
-    let mut matched = false;
+    let nodes = matching_endpoint_nodes(root.as_ref(), &topic);
+    let matched = !nodes.is_empty();
 
-    while let Some(node) = cursor.find_next(&segments) {
-        matched = true;
+    for node in nodes {
         // Spawn per-match dispatch (O.1 concurrent)
         let ctx_channel = channel.clone();
         let ctx_publish = publish.clone();
@@ -296,12 +294,10 @@ async fn dispatch_incoming_to_endpoints_owned<W, TS>(
     TS: TransportSpec<Wire = W>,
 {
     let topic = incoming.topic.clone();
-    let segments: Vec<&str> = topic.split('/').collect();
-    let mut cursor = root.walk_cursor(&topic);
-    let mut matched = false;
+    let nodes = matching_endpoint_nodes(root.as_ref(), &topic);
+    let matched = !nodes.is_empty();
 
-    while let Some(node) = cursor.find_next(&segments) {
-        matched = true;
+    for node in nodes {
         let ctx_channel = channel.clone();
         let ctx_inc = incoming.clone();
         let ctx_node = node;
@@ -341,4 +337,3 @@ fn build_connect(config: &MqttClientConfig) -> ConnectPacket {
         }),
     }
 }
-

@@ -14,6 +14,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use hotaru_core::connection::ConnStream;
+use hotaru_core::url::PathPattern;
 use hotaru_core::protocol::Channel; // `close()` on the takeover path
 
 use crate::channel::MqttChannel;
@@ -110,8 +111,13 @@ pub struct SubscriberEntry<W: ConnStream> {
 // ----------------------------------------------------------------------------
 
 struct SubscriptionTree {
-    /// filter (e.g. "sensors/+/temp") → set of (client_id, max_qos)
-    subs: DashMap<Arc<str>, Arc<DashMap<Arc<str>, QoS>>>,
+    /// Raw filter (the UNSUBSCRIBE key) → compiled filter + subscribers.
+    subs: DashMap<Arc<str>, Arc<SubscriptionBucket>>,
+}
+
+struct SubscriptionBucket {
+    filter: Arc<[PathPattern]>,
+    subscribers: DashMap<Arc<str>, QoS>,
 }
 
 impl SubscriptionTree {
@@ -121,35 +127,46 @@ impl SubscriptionTree {
         }
     }
 
-    fn subscribe(&self, client_id: Arc<str>, filter: Arc<str>, qos: QoS) {
-        let set = self
+    fn subscribe(
+        &self,
+        client_id: Arc<str>,
+        raw_filter: Arc<str>,
+        filter: Vec<PathPattern>,
+        qos: QoS,
+    ) {
+        let bucket = self
             .subs
-            .entry(filter)
-            .or_insert_with(|| Arc::new(DashMap::new()))
+            .entry(raw_filter)
+            .or_insert_with(|| {
+                Arc::new(SubscriptionBucket {
+                    filter: filter.into(),
+                    subscribers: DashMap::new(),
+                })
+            })
             .clone();
-        set.insert(client_id, qos);
+        bucket.subscribers.insert(client_id, qos);
     }
 
     fn unsubscribe(&self, client_id: &Arc<str>, filter: &str) {
-        if let Some(set) = self.subs.get(filter) {
-            set.remove(client_id);
+        if let Some(bucket) = self.subs.get(filter) {
+            bucket.subscribers.remove(client_id);
         }
     }
 
     /// Remove all subscriptions belonging to one client (used on disconnect).
     fn remove_client(&self, client_id: &Arc<str>) {
         for entry in self.subs.iter() {
-            entry.value().remove(client_id);
+            entry.value().subscribers.remove(client_id);
         }
     }
 
     /// Return (client_id, max_qos) for every subscription matching the topic.
     fn matching(&self, topic: &str) -> Vec<(Arc<str>, QoS)> {
-        let topic_segs: Vec<&str> = topic.split('/').collect();
+        let topic_segs = crate::topic::split_topic_literal(topic);
         let mut results = Vec::new();
         for entry in self.subs.iter() {
-            if filter_matches(entry.key(), &topic_segs) {
-                for sub in entry.value().iter() {
+            if compiled_filter_matches(&entry.value().filter, &topic_segs) {
+                for sub in entry.value().subscribers.iter() {
                     results.push((sub.key().clone(), *sub.value()));
                 }
             }
@@ -159,23 +176,31 @@ impl SubscriptionTree {
 }
 
 /// MQTT 3.1.1 §4.7 topic filter matching.
-fn filter_matches(filter: &str, topic_segs: &[&str]) -> bool {
-    let filter_segs: Vec<&str> = filter.split('/').collect();
+fn compiled_filter_matches(filter: &[PathPattern], topic_segs: &[&str]) -> bool {
+    // MQTT 3.1.1 §4.7.2: a filter whose first level is a wildcard must not
+    // match a Topic Name beginning with `$`. A literal `$SYS/#` filter remains
+    // valid, and a wildcard below the first level may still match `$`.
+    if topic_segs.first().is_some_and(|segment| segment.starts_with('$'))
+        && matches!(filter.first(), Some(PathPattern::Any | PathPattern::AnyPath))
+    {
+        return false;
+    }
+
     let mut t = 0;
     let mut f = 0;
 
-    while f < filter_segs.len() {
-        match filter_segs[f] {
-            "#" => return true,
-            "+" => {
+    while f < filter.len() {
+        match &filter[f] {
+            PathPattern::AnyPath => return true,
+            PathPattern::Any => {
                 if t >= topic_segs.len() {
                     return false;
                 }
                 t += 1;
                 f += 1;
             }
-            seg => {
-                if t >= topic_segs.len() || seg != topic_segs[t] {
+            pattern => {
+                if t >= topic_segs.len() || !pattern.matches(topic_segs[t]) {
                     return false;
                 }
                 t += 1;
@@ -184,6 +209,12 @@ fn filter_matches(filter: &str, topic_segs: &[&str]) -> bool {
         }
     }
     t == topic_segs.len()
+}
+
+#[cfg(test)]
+fn filter_matches(filter: &str, topic_segs: &[&str]) -> bool {
+    let filter = crate::topic::parse_subscribe_filter(filter).expect("valid test filter");
+    compiled_filter_matches(&filter, topic_segs)
 }
 
 // ----------------------------------------------------------------------------
@@ -433,13 +464,14 @@ impl<W: ConnStream> Broker<W> {
 
         let mut codes = Vec::with_capacity(filters.len());
         for tf in filters {
-            // Validate filter (could fail).
-            match crate::topic::validate_subscribe_filter(&tf.filter) {
-                Ok(()) => {
+            // Parse once at subscription time; fanout reuses the compiled path.
+            match crate::topic::parse_subscribe_filter(&tf.filter) {
+                Ok(filter) => {
                     entry.filters.insert(tf.filter.clone(), tf.qos);
                     self.inner.subscriptions.subscribe(
                         client_id.clone(),
                         tf.filter.clone(),
+                        filter,
                         tf.qos,
                     );
                     codes.push(SubackCode::Granted(tf.qos));

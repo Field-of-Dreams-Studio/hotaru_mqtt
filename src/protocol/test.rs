@@ -1,7 +1,16 @@
 //! Protocol tests: keep-alive deadline and ping-interval arithmetic.
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use hotaru_core::executable::ExecutableBinding;
+use hotaru_core::extensions::ParamsClone;
+use hotaru_core::protocol::Protocol;
+use hotaru_core::url::{PathPattern, UrlRoot, tokens_to_patterns};
+
+use crate::{MQTT, MqttContext};
+
+use super::matching_endpoint_nodes;
 use super::client::client_ping_interval;
 use super::server::server_read_deadline;
 
@@ -44,4 +53,79 @@ fn the_client_pings_on_its_own_interval_not_the_grace() {
     assert_eq!(Some(Duration::from_secs(60)), client_ping_interval(60));
     assert_eq!(Some(Duration::from_secs(1)), client_ping_interval(1));
     assert!(client_ping_interval(60).unwrap() < server_read_deadline(60).unwrap());
+}
+
+type TestRoot = UrlRoot<MqttContext, hotaru_io_tokio::TcpTransport>;
+
+#[allow(deprecated)]
+fn register_test_endpoint(root: &TestRoot, path: &str) {
+    root.sub_url(
+        path,
+        ExecutableBinding::new().with_handler(Arc::new(|ctx: MqttContext| async move {
+            Ok(ctx)
+        })),
+        ParamsClone::default(),
+    )
+    .expect("test endpoint registration");
+}
+
+#[test]
+fn mqtt_protocol_overrides_the_framework_url_grammar() {
+    let tokens = <MQTT as Protocol>::tokenize_url(r"sport/+/a\<b/#").unwrap();
+    let (patterns, _) = tokens_to_patterns(&tokens).unwrap();
+    assert_eq!(
+        patterns,
+        vec![
+            PathPattern::Literal("sport".into()),
+            PathPattern::Any,
+            PathPattern::Literal(r"a\<b".into()),
+            PathPattern::AnyPath,
+        ]
+    );
+    assert_eq!(
+        <MQTT as Protocol>::lit_parser("sport//score"),
+        vec!["sport", "", "score"]
+    );
+}
+
+#[test]
+fn endpoint_hash_matches_its_parent_without_running_the_empty_parent() {
+    let root = TestRoot::new();
+    register_test_endpoint(&root, "sport/<**path>");
+
+    let nodes = matching_endpoint_nodes(&root, "sport");
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(nodes[0].path(), &PathPattern::AnyPath);
+}
+
+#[test]
+fn exact_endpoint_precedes_hash_when_both_match_the_parent() {
+    let root = TestRoot::new();
+    register_test_endpoint(&root, "sport/<**path>");
+    register_test_endpoint(&root, "sport");
+
+    let nodes = matching_endpoint_nodes(&root, "sport");
+    assert_eq!(nodes.len(), 2);
+    assert_eq!(nodes[0].path(), &PathPattern::Literal("sport".into()));
+    assert_eq!(nodes[1].path(), &PathPattern::AnyPath);
+}
+
+#[test]
+fn endpoint_root_wildcards_do_not_match_system_topics() {
+    let root = TestRoot::new();
+    register_test_endpoint(&root, "<**path>");
+    register_test_endpoint(&root, "<mqtt_level>/status");
+    register_test_endpoint(&root, "$SYS/<**path>");
+
+    let nodes = matching_endpoint_nodes(&root, "$SYS/status");
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(nodes[0].path(), &PathPattern::AnyPath);
+}
+
+#[test]
+fn endpoint_wildcards_below_the_first_level_may_match_dollar_segments() {
+    let root = TestRoot::new();
+    register_test_endpoint(&root, "sport/<mqtt_level>");
+
+    assert_eq!(matching_endpoint_nodes(&root, "sport/$value").len(), 1);
 }

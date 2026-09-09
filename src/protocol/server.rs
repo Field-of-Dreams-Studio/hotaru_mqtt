@@ -446,12 +446,10 @@ where
     TS: TransportSpec<Wire = W>,
 {
     let topic = publish.topic.clone();
-    let segments: Vec<&str> = topic.split('/').collect();
-    let mut cursor = root.walk_cursor(&topic);
     let mut fanout = true;
     let mut current = publish;
 
-    while let Some(node) = cursor.find_next(&segments) {
+    for node in matching_endpoint_nodes(root.as_ref(), &topic) {
         let mut ctx = MqttContext::<TS>::default();
         ctx.set_incoming(incoming_from_packet(&current));
         ctx.install_channel(channel.clone());
@@ -477,4 +475,3 @@ where
 
     if fanout { Some(current) } else { None }
 }
-

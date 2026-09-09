@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use hotaru_core::app::common::RuntimeConfig;
 use hotaru_core::connection::{ConnStream, HotaruRead, HotaruWrite, TransportSpec};
 use hotaru_core::protocol::{Channel as _, CtxError, Protocol, ProtocolFlow, ProtocolRole};
-use hotaru_core::url::UrlRoot;
+use hotaru_core::url::{FrameNode, PathPattern, UrlNode, UrlRoot};
 
 use crate::broker::incoming_from_packet;
 use crate::channel::MqttChannel;
@@ -121,6 +121,16 @@ where
         None
     }
 
+    fn tokenize_url(
+        input: &str,
+    ) -> Result<Vec<hotaru_core::url::RawToken>, hotaru_core::url::PatternError> {
+        crate::topic::tokenize_subscribe_filter(input)
+    }
+
+    fn lit_parser(input: &str) -> Vec<&str> {
+        crate::topic::split_topic_literal(input)
+    }
+
     fn detect(initial_bytes: &[u8]) -> bool {
         // MQTT 3.1.1: first byte of CONNECT is 0x10
         initial_bytes
@@ -195,6 +205,57 @@ where
 // ----------------------------------------------------------------------------
 // Shared across both roles
 // ----------------------------------------------------------------------------
+
+/// Return every registered MQTT endpoint matching `topic`.
+///
+/// The generic URL cursor deliberately knows nothing about MQTT's two special
+/// matching rules. MQTT 3.1.1 §4.7.2 excludes a root `+`/`#` branch for topics
+/// beginning with `$`, and §4.7.1.2 lets a terminal `#` consume zero levels
+/// (`sport/#` matches `sport`). Keep both protocol-specific adjustments at the
+/// boundary, rather than changing HTTP routing semantics in `hotaru_core`.
+fn matching_endpoint_nodes<TS>(
+    root: &UrlRoot<MqttContext<TS>, TS>,
+    topic: &str,
+) -> Vec<Arc<UrlNode<MqttContext<TS>, TS>>>
+where
+    TS: TransportSpec,
+{
+    let segments = crate::topic::split_topic_literal(topic);
+    let mut cursor = root.walk_cursor(topic);
+    let system_topic = topic.starts_with('$');
+    let mut matches = Vec::new();
+
+    while let Some(node) = cursor.find_next(&segments) {
+        // A root-level match is returned before the cursor pushes a node frame;
+        // deeper matches retain their root-level node in frame 1.
+        let root_pattern = match cursor.frames().get(1).map(|frame| &frame.node) {
+            Some(FrameNode::Node(root_node)) => root_node.path(),
+            _ => node.path(),
+        };
+        if system_topic
+            && matches!(root_pattern, PathPattern::Any | PathPattern::AnyPath)
+        {
+            continue;
+        }
+
+        // Intermediate tree nodes have no executable chain. Running one calls
+        // RequestContext::handle_error and, on the server, suppresses fanout.
+        if node.has_handler() {
+            matches.push(node.clone());
+        }
+
+        // `WalkCursor` cannot descend once the last input segment has already
+        // selected `node`. A terminal AnyPath child is the one legal MQTT
+        // zero-width continuation, so surface it explicitly.
+        if let Some(any_path) = node.children().match_any_path()
+            && any_path.has_handler()
+        {
+            matches.push(any_path);
+        }
+    }
+
+    matches
+}
 
 // ============================================================================
 // Inbound dispatch — common logic for server & client
